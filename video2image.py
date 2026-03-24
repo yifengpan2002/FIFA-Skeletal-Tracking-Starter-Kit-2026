@@ -1,6 +1,7 @@
 import cv2
 import os
 from PIL import Image
+from pathlib import Path
 
 
 def extract_frames(video_path, output_folder, save_as_png=False):
@@ -30,12 +31,38 @@ def extract_frames(video_path, output_folder, save_as_png=False):
     cap.release()
     print(f'Done! {frame_count} frames extracted and saved in "{output_folder}".')
 
+def process_folder(video_folder, output_root, save_as_png=False):
+
+    video_folder = Path(video_folder)
+    output_root = Path(output_root)
+
+    video_files = list(video_folder.glob("*.mp4"))
+
+    print(f"Found {len(video_files)} videos")
+
+    for video in video_files:
+
+        video_name = video.stem
+        output_folder = output_root / video_name
+
+        extract_frames(video, output_folder, save_as_png)
+
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Extract frames from a video file")
-    parser.add_argument("--video_path", type=str, help="Path to the input video file")
-    parser.add_argument("--output_folder", type=str, help="Path to the output folder to save frames")
-    parser.add_argument("--png", action="store_true", help="Save frames as PNG images instead of JPG")
+    parser = argparse.ArgumentParser(description="Extract frames from videos")
+
+    parser.add_argument("--video_folder", type=str, required=True,
+                        help="Folder containing videos")
+
+    parser.add_argument("--output_root", type=str, required=True,
+                        help="Output folder for extracted frames")
+
+    parser.add_argument("--png", action="store_true",
+                        help="Save frames as PNG")
+
     args = parser.parse_args()
 
-    extract_frames(args.video_path, args.output_folder, args.png)
+    process_folder(args.video_folder, args.output_root, args.png)
+
+    # extract_frames(args.video_path, args.output_folder, args.png)

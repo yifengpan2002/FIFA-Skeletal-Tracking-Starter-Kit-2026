@@ -1,0 +1,8 @@
+#for sam3d and mp4
+data/videos/
+data/images/
+# data/skel_2d/
+# data/skel_3d/
+# data/boxes/
+# data/cameras/
+sam_3d_body/

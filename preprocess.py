@@ -11,7 +11,6 @@ import torch
 from tqdm import trange
 from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body_hf
 
-
 def run_eval(model, image_dir, boxes, cam_int=None):
     NUM_FRAMES, NUM_PERSONS, _ = boxes.shape
     skels_2d = np.zeros((NUM_FRAMES, NUM_PERSONS, 25, 2))
