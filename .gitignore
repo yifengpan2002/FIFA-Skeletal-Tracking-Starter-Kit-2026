@@ -6,3 +6,9 @@ data/images/
 # data/boxes/
 # data/cameras/
 sam_3d_body/
+
+lib/
+fifa/
+fifa310/
+outputs/
+__pycache__

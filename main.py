@@ -4,7 +4,6 @@ This script provides a naive baseline for FIFA Skeletal Tracking Challenge.
 Author: Tianjian Jiang
 Date: Nov 10, 2025
 """
-
 from pathlib import Path
 import numpy as np
 import cv2
@@ -13,8 +12,16 @@ import torch.optim as optim
 from tqdm import tqdm
 from lib.camera_tracker import CameraTracker, CameraTrackerOptions
 from lib.postprocess import smoothen
+# from smoothing_help import (
+#     nanmedian_filter_1d,
+#     smooth_xy_sequence,
+#     smooth_xyz_sequence,
+#     remove_3d_spikes,
+# )
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+print(f"Using device: {DEVICE}")
 OPENPOSE_TO_OURS = [0, 2, 5, 3, 6, 4, 7, 9, 12, 10, 13, 11, 14, 22, 19]
 
 
@@ -171,14 +178,65 @@ def fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes):
     }
     valid = ~np.isnan(boxes).any(axis=-1).transpose(1, 0)
     traj_3d = minimize_reprojection_error(
-        pts_3d=torch.tensor(mid_hip_3d[valid], dtype=torch.float32).to("cuda"),
-        pts_2d=torch.tensor(mid_hip_2d[valid], dtype=torch.float32).to("cuda"),
-        R=torch.tensor(camera_params["R"][valid], dtype=torch.float32).to("cuda"),
-        C=torch.tensor(camera_params["C"][valid], dtype=torch.float32).to("cuda"),
-        K=torch.tensor(camera_params["K"][valid], dtype=torch.float32).to("cuda"),
-        k=torch.tensor(camera_params["k"][valid], dtype=torch.float32).to("cuda"),
-    )
+    pts_3d=torch.tensor(mid_hip_3d[valid], dtype=torch.float32).to(DEVICE),
+    pts_2d=torch.tensor(mid_hip_2d[valid], dtype=torch.float32).to(DEVICE),
+    R=torch.tensor(camera_params["R"][valid], dtype=torch.float32).to(DEVICE),
+    C=torch.tensor(camera_params["C"][valid], dtype=torch.float32).to(DEVICE),
+    K=torch.tensor(camera_params["K"][valid], dtype=torch.float32).to(DEVICE),
+    k=torch.tensor(camera_params["k"][valid], dtype=torch.float32).to(DEVICE),
+)
     return traj_3d, valid
+
+# def fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes):
+#     """More stable translation refinement with smoothing and stricter valid-frame masking."""
+#     NUM_PERSONS = predictions.shape[0]
+#     NUM_FRAMES = predictions.shape[1]
+
+#     # body joints in current baseline ordering:
+#     # 7 = left hip, 8 = right hip
+#     left_hip_3d = predictions[..., 7, :]
+#     right_hip_3d = predictions[..., 8, :]
+#     mid_hip_3d = 0.5 * (left_hip_3d + right_hip_3d)
+
+#     left_hip_2d = skels_2d[..., 7, :].transpose(1, 0, 2)   # (P, T, 2)
+#     right_hip_2d = skels_2d[..., 8, :].transpose(1, 0, 2)  # (P, T, 2)
+#     mid_hip_2d = 0.5 * (left_hip_2d + right_hip_2d)
+
+#     # smooth per person through time before optimization
+#     for person in range(NUM_PERSONS):
+#         mid_hip_3d[person] = smooth_xyz_sequence(mid_hip_3d[person], k=5)
+#         mid_hip_2d[person] = smooth_xy_sequence(mid_hip_2d[person], k=5)
+
+#     R = np.array([k[0] for k in Rt])
+#     t = np.array([k[1] for k in Rt])
+#     C = (-t[:, None] @ R).squeeze(1)
+
+#     camera_params = {
+#         "K": cameras["K"][None].repeat(NUM_PERSONS, axis=0),
+#         "R": R[None].repeat(NUM_PERSONS, axis=0),
+#         "C": C[None].repeat(NUM_PERSONS, axis=0),
+#         "k": cameras["k"][None, ..., :2].repeat(NUM_PERSONS, axis=0),
+#     }
+
+#     # old baseline only used boxes
+#     valid_boxes = ~np.isnan(boxes).any(axis=-1).transpose(1, 0)            # (P, T)
+#     valid_2d = ~np.isnan(mid_hip_2d).any(axis=-1)                          # (P, T)
+#     valid_3d = ~np.isnan(mid_hip_3d).any(axis=-1)                          # (P, T)
+#     valid = valid_boxes & valid_2d & valid_3d
+
+#     traj_3d = torch.zeros((valid.sum(), 3), dtype=torch.float32, device=DEVICE)
+#     if valid.sum() == 0:
+#         return traj_3d, valid
+
+#     traj_3d = minimize_reprojection_error(
+#         pts_3d=torch.tensor(mid_hip_3d[valid], dtype=torch.float32).to(DEVICE),
+#         pts_2d=torch.tensor(mid_hip_2d[valid], dtype=torch.float32).to(DEVICE),
+#         R=torch.tensor(camera_params["R"][valid], dtype=torch.float32).to(DEVICE),
+#         C=torch.tensor(camera_params["C"][valid], dtype=torch.float32).to(DEVICE),
+#         K=torch.tensor(camera_params["K"][valid], dtype=torch.float32).to(DEVICE),
+#         k=torch.tensor(camera_params["k"][valid], dtype=torch.float32).to(DEVICE),
+#     )
+#     return traj_3d, valid
 
 
 def process_sequence(
@@ -253,11 +311,52 @@ def process_sequence(
             predictions[person, frame_idx] = skel_3d
 
     # fine-tune the translation to minimize reprojection error
+        # MODIFIED BASELINE POST-PROCESSING
+
+    # Step 1:
+    # Keep the baseline translation refinement,
+    # but now it uses our improved fine_tune_translation().
     traj_3d, valid = fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes)
     predictions[valid] = predictions[valid] + traj_3d.cpu().numpy()[:, None, :]
+
+    # Step 2:
+    # Keep the original baseline smoother.
+    # This is NOT new; it already existed in the baseline.
     for person in range(NUM_PERSONS):
+        # comment out the baseline panda smoothing.
         predictions[person] = smoothen(predictions[person])
-    
+
+        # # NEW PART ADDED BY US:
+        # # Smooth each joint trajectory across time with our robust median smoother.
+        # # This reduces per-joint jitter after the baseline smoothing step.
+        # for joint in range(predictions.shape[2]):
+        #     predictions[person, :, joint, :] = smooth_xyz_sequence(
+        #         predictions[person, :, joint, :], k=5
+        #     )
+
+        # # NEW PART ADDED BY US:
+        # # Compute pelvis center from left and right hips.
+        # # We use the pelvis because it is a stable body center.
+        # pelvis = 0.5 * (
+        #     predictions[person, :, 7, :] + predictions[person, :, 8, :]
+        # )
+
+        # # NEW PART ADDED BY US:
+        # # Remove sudden unrealistic jumps in the pelvis trajectory.
+        # pelvis = remove_3d_spikes(pelvis, factor=3.0)
+
+        # # NEW PART ADDED BY US:
+        # # Compute how much the corrected pelvis differs from the current pelvis.
+        # current_pelvis = 0.5 * (
+        #     predictions[person, :, 7, :] + predictions[person, :, 8, :]
+        # )
+        # delta = pelvis - current_pelvis
+
+        # # NEW PART ADDED BY US:
+        # # Apply the same pelvis correction to the whole skeleton.
+        # # This shifts the whole body consistently instead of correcting joints independently.
+        # predictions[person] = predictions[person] + delta[:, None, :]
+
     # update the camera parameters
     cameras["R"] = np.array([k[0] for k in Rt], dtype=np.float32)
     cameras["t"] = np.array([k[1] for k in Rt], dtype=np.float32)
