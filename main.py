@@ -18,6 +18,9 @@ from lib.postprocess import smoothen
 #     smooth_xyz_sequence,
 #     remove_3d_spikes,
 # )
+import subprocess
+from pathlib import Path
+
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -252,6 +255,23 @@ def process_sequence(
     2. periodically refine the camera pose using lane lines
     3. project the 3D skeletons to the 2D image plane and optimize the translation to minimize reprojection error
     """
+    
+    #make each path
+    project_root = Path.cwd().resolve()
+
+    crop_dir = (project_root / "outputs" / "player_crops" / video_path.stem).resolve()
+    crop_dir.mkdir(parents=True, exist_ok=True)
+
+    json_dir = (project_root / "outputs" / "openpose_json" / video_path.stem).resolve()
+    json_dir.mkdir(parents=True, exist_ok=True)
+
+    rerender_dir = (project_root / "outputs" / "rerender_dir" / video_path.stem).resolve()
+    rerender_dir.mkdir(parents=True, exist_ok=True)
+
+    #for ivslab path
+    #openpose_root = Path(r"C:\Users\IVSLab\Documents\ypan179-sport research\my_own_repo\openpose")
+    openpose_root = Path(r"C:\Users\Yifeng Pan\Downloads\openpose")
+
     NUM_FRAMES, NUM_PERSONS, _ = boxes.shape
     predictions = np.zeros((NUM_PERSONS, NUM_FRAMES, 15, 3))
     predictions.fill(np.nan)
@@ -287,13 +307,38 @@ def process_sequence(
         yaw, pitch, roll = state.get_ypr()
         pbar.set_postfix_str(f"yaw={yaw:.1f}, pitch={pitch:.1f}, roll={roll:.1f}")
         Rt.append((state.R.copy(), state.t.copy()))
+        H, W = img.shape[:2]
 
         for person in range(NUM_PERSONS):
             # decide which foot is in contact with the ground by checking which has lower y
             box = boxes[frame_idx, person]
+            
             if np.isnan(box).any():
                 continue
+             # 2. 取出 box，并转成 int
+            x1, y1, x2, y2 = box.astype(int)
 
+
+            # 4. 检查 box 是否合法
+            if x2 <= x1 or y2 <= y1:
+                print(f"Invalid box at frame {frame_idx}, person {person}: {box}")
+                continue
+
+            # 5. crop 当前球员
+            crop = img[y1:y2, x1:x2]
+
+            # 6. 防止空 crop
+            if crop.size == 0:
+                print(f"Empty crop at frame {frame_idx}, person {person}: {box}")
+                continue
+
+            # 7. 保存 crop
+            crop_name = f"f{frame_idx:05d}_p{person:03d}.jpg"
+            crop_path = crop_dir / crop_name
+            cv2.imwrite(str(crop_path), crop)
+
+            #print out the example
+            # print(f"Saved crop: {crop_path} | frame={frame_idx}, person={person}, box={box}")
             skel_2d = skels_2d[frame_idx, person]
 
             IDX = np.argmax(skel_2d[:, 1])
@@ -310,6 +355,13 @@ def process_sequence(
             skel_3d = skel_3d - skel_3d[IDX] + intersection
             predictions[person, frame_idx] = skel_3d
 
+    run_openpose_on_crops(
+        openpose_root=openpose_root,
+        crop_dir=crop_dir,
+        json_dir=json_dir,
+        render_pose=1,
+        write_images_dir=rerender_dir,
+    )
     # fine-tune the translation to minimize reprojection error
         # MODIFIED BASELINE POST-PROCESSING
 
@@ -370,6 +422,58 @@ def load_sequences(sequences_file: Path | str) -> list[str]:
     sequences = [s.strip() for s in sequences]
     return sequences
 
+#function add by me:
+def run_openpose_on_crops(
+    openpose_root: str | Path,
+    crop_dir: str | Path,
+    json_dir: str | Path,
+    render_pose: int = 0,
+    write_images_dir: str | Path | None = None,
+):
+    """
+    Run OpenPose on a folder of cropped player images.
+
+    Args:
+        openpose_root: root folder of OpenPose, e.g. C:/.../openpose
+        crop_dir: folder containing cropped player images
+        json_dir: output folder for OpenPose JSON results
+        render_pose: 0 = no rendered images, 1 = save rendered images if write_images_dir is given
+        write_images_dir: optional folder to save rendered images
+
+    Returns:
+        None
+    """
+    openpose_root = Path(openpose_root)
+    crop_dir = Path(crop_dir)
+    json_dir = Path(json_dir)
+
+    json_dir.mkdir(parents=True, exist_ok=True)
+
+    exe_path = openpose_root / "bin" / "OpenPoseDemo.exe"
+
+    cmd = [
+        str(exe_path),
+        "--image_dir", str(crop_dir),
+        "--display", "0",
+        "--render_pose", str(render_pose),
+        "--write_json", str(json_dir),
+    ]
+
+    if write_images_dir is not None:
+        write_images_dir = Path(write_images_dir)
+        write_images_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--write_images", str(write_images_dir)])
+
+    print("Running OpenPose command:")
+    print(" ".join(cmd))
+
+    # Very important: cwd must be OpenPose root so that models/ can be found
+    subprocess.run(
+        cmd,
+        cwd=str(openpose_root),
+        check=True
+    )
+
 
 def main(
     sequences: list[str],
@@ -387,6 +491,7 @@ def main(
 
     root = Path("data/")
     solutions = {}
+
     for sequence in sequences:
         camera = dict(np.load(root / "cameras" / f"{sequence}.npz"))
         skel2d = np.load(root / "skel_2d" / f"{sequence}.npy")
@@ -410,7 +515,7 @@ def main(
         if export_camera:
             camera_path = camera_dir / f"{sequence}.npz"
             np.savez(camera_path, **camera)
-
+    
     if not output.parent.exists():
         output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **solutions)
